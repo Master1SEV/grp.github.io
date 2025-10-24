@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Gravel Planner</title>
+    
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    
+    <style>
+        /* Стили для Telegram Web App */
+        html, body { 
+            height: 100%; 
+            margin: 0; 
+            padding: 0; 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+            background-color: var(--tg-theme-bg-color, #ffffff); /* Используем цвета Telegram */
+            color: var(--tg-theme-text-color, #000000);
+            overflow: hidden; /* Убираем 'резинку' */
+        }
+        #app {
+            display: flex;
+            flex-direction: column;
+            height: 100vh; /* Растягиваем на весь экран */
+        }
+        #map {
+            flex-grow: 1; /* Карта занимает все доступное место */
+            width: 100%;
+            background-color: #eee;
+        }
+        #controls {
+            padding: 10px; 
+            box-sizing: border-box; 
+            background-color: var(--tg-theme-secondary-bg-color, #f4f4f4);
+            border-top: 1px solid var(--tg-theme-hint-color, #ddd);
+            flex-shrink: 0; /* Панель не сжимается */
+        }
+        button {
+            padding: 10px 15px;
+            font-size: 16px;
+            margin-right: 5px;
+            border: none;
+            border-radius: 8px;
+            font-weight: 500;
+            background-color: var(--tg-theme-button-color, #007aff);
+            color: var(--tg-theme-button-text-color, #ffffff);
+            cursor: pointer;
+        }
+        button:disabled {
+            background-color: #d3d3d3;
+            color: #888888;
+            cursor: not-allowed;
+        }
+        #status-panel {
+            padding-top: 10px;
+        }
+        #status { font-weight: 500; }
+        #result { font-size: 14px; margin-top: 5px; }
+        
+        /* Маркеры Leaflet */
+        .leaflet-marker-icon {
+            filter: drop-shadow(0 2px 3px rgba(0,0,0,0.4));
+        }
+    </style>
+</head>
+<body>
+
+    <div id="app">
+        <!-- 1. Контейнер карты -->
+        <div id="map"></div>
+
+        <!-- 2. Элементы управления -->
+        <div id="controls">
+            <div>
+                <button id="setStartBtn">1. Старт</button>
+                <button id="setEndBtn" disabled>2. Финиш</button>
+                <button id="calculateBtn" disabled>Рассчитать</button>
+                <button id="resetBtn" disabled>Сброс</button>
+            </div>
+            <div id="status-panel">
+                <div id="status">Нажмите "Старт" и выберите точку на карте...</div>
+                <div id="result"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 3. Подключение JS (Leaflet и Telegram) -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+
+    <!-- 4. JS Логика приложения -->
+    <script>
+        // --- 4.0 Конфигурация ---
+        
+        // !!! ВАЖНО: Замените эту пустую строку на АБСОЛЮТНЫЙ URL вашего бэкенд-сервера
+        // Например: 'https://my-gravel-backend.com'
+        // Без этого fetch() работать не будет.
+        const API_BASE_URL = ''; 
+        
+        // --- 4.1 Инициализация ---
+        const tg = window.Telegram.WebApp;
+        tg.ready();
+        tg.expand(); // Раскрываем приложение на весь экран
+
+        const map = L.map('map', { zoomControl: false }).setView([55.75, 37.61], 10); // Убрали +/-, т.к. мешает на мобильных
+        
+        // БЫЛО: Стандартная карта OpenStreetMap
+        // L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        //     attribution: '&copy; OpenStreetMap',
+        //     maxZoom: 18,
+        // }).addTo(map);
+
+        // СТАЛО: Минималистичная карта CartoDB Positron
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+            subdomains: 'abcd',
+            maxZoom: 19
+        }).addTo(map);
+
+
+        // --- 4.2 DOM Элементы ---
+        const startBtn = document.getElementById('setStartBtn');
+        const endBtn = document.getElementById('setEndBtn');
+        const calcBtn = document.getElementById('calculateBtn');
+        const resetBtn = document.getElementById('resetBtn');
+        const statusEl = document.getElementById('status');
+        const resultEl = document.getElementById('result');
+
+        // --- 4.3 Состояние (State) ---
+        let state = {
+            mode: 'idle', // 'idle', 'set_start', 'set_end'
+            startPoint: null, // L.LatLng
+            endPoint: null, // L.LatLng
+            startMarker: null, // L.Marker
+            endMarker: null, // L.Marker
+            routeLayer: null, // L.GeoJSON
+            // Сохраняем статистику для отправки на бэкенд при сохранении
+            routeStats: null, // { distance_km: 0, gravel_percent: 0 }
+        };
+        
+        // --- 4.4 Обработчики кнопок ---
+        startBtn.onclick = () => {
+            state.mode = 'set_start';
+            updateUI();
+            statusEl.textContent = 'Нажмите на карту, чтобы указать СТАРТ';
+        };
+
+        endBtn.onclick = () => {
+            state.mode = 'set_end';
+            updateUI();
+            statusEl.textContent = 'Нажмите на карту, чтобы указать ФИНИШ';
+        };
+
+        resetBtn.onclick = () => {
+            if (state.startMarker) map.removeLayer(state.startMarker);
+            if (state.endMarker) map.removeLayer(state.endMarker);
+            clearRouteLayer(); // Очищаем слой маршрута
+            
+            state = { 
+                ...state, 
+                mode: 'idle', 
+                startPoint: null, 
+                endPoint: null, 
+                startMarker: null, 
+                endMarker: null,
+                routeStats: null
+            };
+            
+            statusEl.textContent = 'Нажмите "Старт" и выберите точку на карте...';
+            resultEl.textContent = '';
+            tg.MainButton.hide(); // Скрываем кнопку Telegram
+            updateUI();
+        };
+
+        calculateBtn.onclick = async () => {
+            // Проверка URL (Исправление ошибки)
+            if (!API_BASE_URL || API_BASE_URL === '') {
+                statusEl.textContent = 'Ошибка 😥';
+                resultEl.textContent = 'URL бэкенда не настроен в коде (API_BASE_URL).';
+                console.error('API_BASE_URL is not set!');
+                return;
+            }
+
+            statusEl.textContent = 'Идет расчет маршрута... ⏳';
+            resultEl.textContent = '';
+            calcBtn.disabled = true;
+            
+            try {
+                // ИСПРАВЛЕНО: Используем абсолютный URL
+                const response = await fetch(`${API_BASE_URL}/api/calculate_route`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        start: state.startPoint,
+                        end: state.endPoint
+                    })
+                });
+
+                if (!response.ok) {
+                    // Обрабатываем HTTP-ошибки (404, 500 и т.д.)
+                    const errorData = await response.json().catch(() => ({}));
+                    throw new Error(errorData.message || `HTTP error! status: ${response.status}`);
+                }
+
+                const data = await response.json();
+
+                if (data.status === 'ok') {
+                    clearRouteLayer();
+                    
+                    state.routeLayer = L.geoJSON(data.route_geojson, {
+                        style: { color: '#ff0000', weight: 5, opacity: 0.7 }
+                    }).addTo(map);
+                    
+                    map.fitBounds(state.routeLayer.getBounds(), {padding: [20, 20]});
+                    
+                    const { distance_km, gravel_percent } = data.stats;
+                    state.routeStats = data.stats; // Сохраняем статистику
+                    
+                    statusEl.textContent = '✅ Маршрут готов!';
+                    resultEl.textContent = `Дистанция: ${distance_km.toFixed(1)} км. Гравий: ${gravel_percent}%`;
+                    
+                    // Показываем кнопку Telegram для сохранения
+                    tg.MainButton.setText('Сохранить этот маршрут');
+                    tg.MainButton.show();
+                    
+                } else {
+                    statusEl.textContent = 'Ошибка 😥';
+                    resultEl.textContent = data.message || 'Не удалось построить маршрут.';
+                    calcBtn.disabled = false;
+                }
+
+            } catch (err) {
+                console.error('Fetch error:', err);
+                statusEl.textContent = 'Ошибка 😥';
+                resultEl.textContent = err.message || 'Проблема с сетью. Попробуйте снова.';
+                calcBtn.disabled = false;
+            }
+        };
+
+        // --- 4.5 Обработчик карты ---
+        map.on('click', (e) => {
+            const latlng = e.latlng;
+
+            if (state.mode === 'set_start') {
+                state.startPoint = latlng;
+                if (state.startMarker) {
+                    state.startMarker.setLatLng(latlng);
+                } else {
+                    state.startMarker = createMarker(latlng, 'СТАРТ');
+                }
+                state.mode = 'idle';
+                statusEl.textContent = 'Старт установлен. Теперь выберите финиш.';
+                
+            } else if (state.mode === 'set_end') {
+                state.endPoint = latlng;
+                if (state.endMarker) {
+                    state.endMarker.setLatLng(latlng);
+                } else {
+                    state.endMarker = createMarker(latlng, 'ФИНИШ');
+                }
+                state.mode = 'idle';
+                statusEl.textContent = 'Финиш установлен. Можно рассчитать маршрут.';
+            }
+            
+            // (UX Улучшение) Сбрасываем старый маршрут при клике, если точки меняются
+            if (state.routeLayer) {
+                clearRouteLayer();
+                statusEl.textContent = 'Точки изменены. Нажмите "Рассчитать".';
+            }
+            
+            updateUI();
+        });
+
+        // --- 4.6 Вспомогательные функции ---
+        
+        function createMarker(latlng, title) {
+            const marker = L.marker(latlng, { draggable: true })
+                .addTo(map)
+                .bindPopup(`<b>Точка ${title}</b><br>Можно перетащить`);
+            
+            marker.on('dragstart', () => {
+                // (UX Улучшение) Сбрасываем старый маршрут при начале перетаскивания
+                clearRouteLayer();
+            });
+
+            marker.on('dragend', (e) => {
+                if (title === 'СТАРТ') state.startPoint = e.target.getLatLng();
+                if (title === 'ФИНИШ') state.endPoint = e.target.getLatLng();
+                updateUI();
+            });
+            return marker;
+        }
+
+        function clearRouteLayer() {
+            if (state.routeLayer) {
+                map.removeLayer(state.routeLayer);
+                state.routeLayer = null;
+                state.routeStats = null;
+                tg.MainButton.hide();
+                resultEl.textContent = '';
+            }
+        }
+        
+        function updateUI() {
+            // Кнопка Старт
+            startBtn.disabled = (state.mode === 'set_start');
+            
+            // Кнопка Финиш
+            endBtn.disabled = (state.mode === 'set_end' || !state.startPoint);
+
+            // Кнопка Рассчитать
+            // (UX Улучшение) Кнопка активна, если есть 2 точки И НЕТ готового маршрута
+            calcBtn.disabled = (!state.startPoint || !state.endPoint || state.mode !== 'idle' || !!state.routeLayer);
+
+            // Кнопка Сброс
+            resetBtn.disabled = (!state.startPoint && !state.endPoint);
+        }
+
+        // --- 4.7 Интеграция с Telegram (Фаза 5) ---
+        
+        // Обработчик главной кнопки Telegram
+        tg.MainButton.onClick(saveRoute);
+        
+        async function saveRoute() {
+            // Проверяем, есть ли что сохранять
+            if (!state.routeLayer || !state.routeStats || !tg.initDataUnsafe?.user?.id) {
+                tg.showAlert('Нет данных для сохранения или ID пользователя не найден.');
+                return;
+            }
+            
+            // Проверка URL бэкенда
+            if (!API_BASE_URL || API_BASE_URL === '') {
+                tg.showAlert('URL бэкенда не настроен в коде (API_BASE_URL).');
+                return;
+            }
+            
+            tg.MainButton.showProgress(); // Показываем спиннер
+
+            const payload = {
+                route_geojson: state.routeLayer.toGeoJSON(),
+                stats: state.routeStats,
+                start_point: state.startPoint,
+                end_point: state.endPoint
+            };
+
+            const userId = tg.initDataUnsafe.user.id;
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/api/save_route`, {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        // Отправляем ID пользователя для аутентификации на бэкенде
+                        'Authorization': `Bearer ${userId}` 
+                    },
+                    body: JSON.stringify(payload)
+                });
+                
+                tg.MainButton.hideProgress();
+
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data.status === 'saved') {
+                        // (UX) Опционально: можно показать список маршрутов, 
+                        // но по ТЗ Фазы 5 мы просто закрываем
+                        tg.close();
+                    }
+                } else {
+                    const errorData = await response.json().catch(() => ({}));
+                    tg.showAlert(`Ошибка сохранения: ${errorData.message || response.statusText}`);
+                }
+                
+            } catch (err) {
+                tg.MainButton.hideProgress();
+                tg.showAlert(`Ошибка сети при сохранении: ${err.message}`);
+                console.error('Save error:', err);
+            }
+        }
+        
+    </script>
+</body>
+</html>
+
+
